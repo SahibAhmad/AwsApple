@@ -1,109 +1,107 @@
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+import os
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tensorflow as tf
 from PIL import Image
-from db import get_all_products, user_exists, get_user_info ,get_all_products,add_user
 import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+
+
+# Internal modules
+from db import (
+    get_all_products, get_orders_by_user, mark_order_received, update_order_status, user_exists, get_user_info,
+    add_user, fetch_user_by_id, update_user_info,
+    add_order  # ➕ Import add_order
+)
 from Data import data
-from dotenv import load_dotenv
+
+# Load environment variables
 load_dotenv()
+
+# Flask setup
 app = Flask(__name__)
 CORS(app)
+
+
+# Load models
 part_classifier_model = tf.keras.models.load_model('../model-train/classifier.h5')
 disease_detection_model = tf.keras.models.load_model('../model-train/apple_disease_detector.h5')
+
+# Constants
 part_classes = ['leaf', 'non-leaf']
-disease_classes = [
-    'alternaria', 'healthy',  'mossaic', 'scab'
-]
+disease_classes = ['alternaria', 'healthy', 'mossaic', 'scab']
+
+# Utility functions
 def preprocess_image(image, target_size=(224, 224)):
-    image = Image.open(image)
-    image = image.convert('RGB')
-    image = image.resize(target_size)
-    image = np.array(image)
-    image = preprocess_input(image)
-    image = np.expand_dims(image, axis=0)
+    image = Image.open(image).convert('RGB').resize(target_size)
+    image = np.expand_dims(preprocess_input(np.array(image)), axis=0)
     return image
+
 def classify_plant_part(image):
-    processed_image = preprocess_image(image)
-    predictions = part_classifier_model.predict(processed_image)
-    if (predictions > 0.5):
-        return "non-leaf";
-    else:
-        return "leaf"
+    predictions = part_classifier_model.predict(preprocess_image(image))
+    return "non-leaf" if predictions > 0.5 else "leaf"
+
 def detect_disease(image):
-    processed_image = preprocess_image(image)
-    predictions = disease_detection_model.predict(processed_image)
+    predictions = disease_detection_model.predict(preprocess_image(image))
     return disease_classes[np.argmax(predictions)]
+
 def get_chemicals(disease=None):
-    # Random stage selection (as in the original function)
     stage = "Fruit development"
-    # Match disease with chemical recommendations
     for stage_info in data["spray_schedule"]:
         if stage_info["stage"].lower() == stage.lower():
             for chemical in stage_info["chemicals"]:
                 if disease in [d.lower() for d in chemical["disease"]]:
                     quantity = chemical["quantity"]
-                    quantity_for_200_liters = quantity.split()[0] + ' ' + quantity.split()[1]
+                    quantity_for_200_liters = " ".join(quantity.split()[:2])
                     return {
                         "chemical_name": chemical["name"],
                         "quantity_for_200_liters": quantity_for_200_liters,
                         "brands": chemical["brands"]
                     }
     return None
+
+# ------------------- ROUTES -------------------
+
 @app.route('/classify_part', methods=['POST'])
 def classify_part_route():
     if 'image' not in request.files:
         return jsonify({"error": "No image provided"}), 400
-    image = request.files['image']
-    part_type = classify_plant_part(image)
+    part_type = classify_plant_part(request.files['image'])
     return jsonify({"part_type": part_type})
+
 @app.route('/detect_disease', methods=['POST'])
 def detect_disease_route():
     if 'image' not in request.files:
         return jsonify({"error": "No image provided"}), 400
     image = request.files['image']
-    part_type = classify_plant_part(image)
-    if part_type != "leaf":
+    if classify_plant_part(image) != "leaf":
         return jsonify({"message": "Disease detection only applicable for leaves"}), 400
-    disease_result = detect_disease(image)
-    return jsonify({"disease": disease_result})
+    return jsonify({"disease": detect_disease(image)})
+
 @app.route('/recommendation', methods=['POST'])
 def recommendation_route():
-    # Expecting only 'disease' in the request
-    data = request.get_json()
-    disease = data.get('disease')
-    # Validate disease
+    disease = request.get_json().get('disease')
     if not disease:
         return jsonify({"error": "'disease' is required."}), 400
     recommendation = get_chemicals(disease)
     if not recommendation:
         return jsonify({"message": "No recommendation found for the given disease."}), 200
     return jsonify(recommendation)
-# @app.route('/products', methods=['GET'])
-# def products_route():
-#     try:
-#         products = get_all_products()
-#         return jsonify(products)
-#     except Exception as e:
-#         return jsonify({"error": str(e)}), 500
+
 @app.route('/products', methods=['GET'])
 def products_route():
     try:
-        products = get_all_products()
-        print("Fetched products from DB:", products)
-        return jsonify(products)
+        return jsonify(get_all_products())
     except Exception as e:
-        print("❌ Error in /products:", e)
         return jsonify({"error": str(e)}), 500
-   
-
 
 @app.route('/user-exists/<user_id>', methods=['GET'])
 def user_exists_route(user_id):
     try:
-        exists = user_exists(user_id)
-        return jsonify({"exists": exists})
+        return jsonify({"exists": user_exists(user_id)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -111,36 +109,109 @@ def user_exists_route(user_id):
 def user_info_route(user_id):
     try:
         user = get_user_info(user_id)
-        if user:
-            return jsonify(user)
-        else:
-            return jsonify({"error": "User not found"}), 404
+        return jsonify(user) if user else ({"error": "User not found"}, 404)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 @app.route('/add-user', methods=['POST'])
 def add_user_route():
     try:
         user_data = request.get_json()
-        required_fields = [
-            'userId', 'name', 'phone', 'pincode', 'state',
-            'district', 'city', 'village_or_locality',
-            'landmark', 'address_line'
-        ]
-
-        if not user_data or any(field not in user_data for field in required_fields):
+        required = ['userId', 'name', 'phone', 'pincode', 'state',
+                    'district', 'city', 'village_or_locality', 'landmark', 'address_line']
+        if not user_data or any(f not in user_data for f in required):
             return jsonify({"error": "Missing required fields"}), 400
-
         if user_exists(user_data['userId']):
             return jsonify({"message": "User already exists"}), 200
+        user_id = add_user(user_data)
+        return jsonify({"message": "User added", "user_id": user_id}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        inserted_id = add_user(user_data)
-        return jsonify({"message": "User added", "user_id": inserted_id}), 201
+@app.route('/get-user/<user_id>', methods=['GET'])
+def get_user_route(user_id):
+    try:
+        user = fetch_user_by_id(user_id)
+        return (jsonify(user), 200) if user else ({"error": "User not found"}, 404)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+@app.route('/update-user/<user_id>', methods=['PUT'])
+def update_user_route(user_id):
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        if not update_user_info(user_id, data):
+            return jsonify({"error": "User not found"}), 404
+        return jsonify({"message": "User updated successfully"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+# place order
+@app.route('/place-order', methods=['POST'])
+def place_order_route():
+    try:
+        data = request.get_json()
+        required = ['userId', 'items', 'paymentMethod', 'totalAmount']
+        if not all(k in data for k in required):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        user = fetch_user_by_id(data['userId'])
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        order = {
+            "userId": data["userId"],
+            "userDetails": user,
+            "items": data["items"],
+            "paymentMethod": data["paymentMethod"],
+            "totalAmount": data["totalAmount"],
+            "status": "Pending",  # You can update this later
+        }
+
+        order_id = add_order(order)
+        return jsonify({"message": "Order placed", "order_id": order_id}), 201
+
+    except Exception as e:
+        print("❌ Error placing order:", e)
+        return jsonify({"error": "Server error"}), 500
+@app.route('/orders/<user_id>', methods=['GET'])
+def get_user_orders(user_id):
+    try:
+        orders = get_orders_by_user(user_id)
+        return jsonify(orders)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/update-order-status/<order_id>', methods=['PUT'])
+def update_order_status_route(order_id):
+    try:
+        data = request.get_json()
+        new_status = data.get("status")
+        if not new_status:
+            return jsonify({"error": "Missing 'status'"}), 400
+
+        if not update_order_status(order_id, new_status):
+            return jsonify({"error": "Order not found or not updated"}), 404
+
+        return jsonify({"message": "Order status updated"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+@app.route('/mark-order-received/<order_id>', methods=['PUT'])
+def mark_order_received_route(order_id):
+    try:
+        if not mark_order_received(order_id):
+            return jsonify({"error": "Order not found or already received"}), 404
+        return jsonify({"message": "Order marked as received"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ------------------- MAIN -------------------
 
 if __name__ == '__main__':
-    app.run(debug=True)
-    # command to run : flask run --host=172.18.1.50 --port=5000
+    app.run(host="0.0.0.0", port=5000, debug=True)
+## ✅ app.py (complete and final version)
+
